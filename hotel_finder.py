@@ -1016,18 +1016,202 @@ def search_curated(checkin: str, checkout: str, lat: float, lon: float,
 
 
 # ---------------------------------------------------------------------------
+# RapidAPI helper: generic hotel search for Priceline / Expedia
+# ---------------------------------------------------------------------------
+
+def _rapidapi_search(host: str, key: str,
+                     checkin: str, checkout: str,
+                     lat: float, lon: float,
+                     cap_usd: float, nights: int,
+                     source_name: str, site_url: str) -> list[Hotel]:
+    """Generic RapidAPI hotel search — tries common endpoint/param shapes."""
+    headers = {
+        "x-rapidapi-key": key,
+        "x-rapidapi-host": host,
+    }
+    param_variants = [
+        {"check_in_date": checkin, "check_out_date": checkout,
+         "city_name": "New York", "country_code": "US",
+         "adults": "1", "rooms_number": "1", "currency": "USD"},
+        {"checkIn": checkin, "checkOut": checkout,
+         "location": "Chelsea, New York, USA",
+         "adults": 1, "rooms": 1, "currency": "USD"},
+        {"check_in": checkin, "check_out": checkout,
+         "latitude": lat, "longitude": lon,
+         "radius": "3", "adults": "1", "rooms": "1"},
+    ]
+    endpoint_variants = [
+        "/api/hotel/search", "/v2/hotel/search", "/hotels/search",
+        "/api/hotels/search", "/v1/hotels/search",
+    ]
+
+    for endpoint in endpoint_variants:
+        for params in param_variants:
+            try:
+                r = std_requests.get(
+                    f"https://{host}{endpoint}",
+                    headers=headers, params=params, timeout=30,
+                )
+                if r.status_code == 404:
+                    break  # wrong endpoint, try next
+                if not r.ok:
+                    continue
+                data = r.json()
+                hotels = _parse_generic_rapidapi(
+                    data, lat, lon, cap_usd, nights,
+                    checkin, checkout, source_name, site_url,
+                )
+                if hotels:
+                    return hotels
+            except Exception:
+                continue
+    return []
+
+
+def _parse_generic_rapidapi(data: dict, lat: float, lon: float,
+                             cap_usd: float, nights: int,
+                             checkin: str, checkout: str,
+                             source_name: str, site_url: str) -> list[Hotel]:
+    """Walk common hotel list shapes in RapidAPI responses."""
+    candidates: list[dict] = []
+    for path in [["data", "hotels"], ["data", "results"], ["hotels"], ["results"], ["data"]]:
+        obj = data
+        for k in path:
+            obj = obj.get(k) if isinstance(obj, dict) else None
+            if obj is None:
+                break
+        if isinstance(obj, list) and obj:
+            candidates = obj
+            break
+
+    hotels = []
+    for item in candidates:
+        try:
+            name = (item.get("name") or item.get("hotel_name")
+                    or item.get("hotelName") or item.get("title") or "")
+            if not name:
+                prop = item.get("property", item.get("hotel", {}))
+                name = prop.get("name", "")
+            if not name:
+                continue
+
+            # All-inclusive total (taxes+fees), walk many schemas
+            total = 0.0
+            for path in [
+                ["property", "priceBreakdown", "allInclusiveAmount", "value"],
+                ["property", "priceBreakdown", "grossPrice", "value"],
+                ["price", "total_inclusive"],
+                ["price", "totalPrice"],
+                ["price", "total"],
+                ["totalPrice"],
+                ["rate_info", "display_all_in_total"],
+                ["price_details", "display_total"],
+            ]:
+                obj = item
+                for k in path:
+                    obj = obj.get(k) if isinstance(obj, dict) else None
+                    if obj is None:
+                        break
+                if obj is not None:
+                    try:
+                        total = float(obj)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            if total == 0:
+                continue
+
+            per_night = total / nights
+            if per_night > cap_usd * 1.30:
+                continue
+
+            hlat = _f(item.get("latitude") or item.get("lat")
+                      or item.get("property", {}).get("latitude")) or None
+            hlon = _f(item.get("longitude") or item.get("lon")
+                      or item.get("property", {}).get("longitude")) or None
+            dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
+
+            stars = (item.get("starRating") or item.get("star_rating")
+                     or item.get("property", {}).get("propertyClass"))
+            rating = (item.get("reviewScore") or item.get("review_score")
+                      or item.get("guestRating") or item.get("rating"))
+
+            hotel_url = (item.get("url") or item.get("hotel_url")
+                         or item.get("property", {}).get("url") or "")
+            if hotel_url and not hotel_url.startswith("http"):
+                hotel_url = site_url.rstrip("/") + "/" + hotel_url.lstrip("/")
+            if not hotel_url:
+                hotel_url = booking_search_url(name, checkin, checkout)
+
+            hotels.append(Hotel(
+                name=name,
+                price_per_night=per_night,
+                total_price=total,
+                currency="USD",
+                address=(item.get("address") or item.get("neighborhood")
+                         or item.get("location", {}).get("address", "") or ""),
+                stars=float(stars) if stars else None,
+                rating=float(rating) if rating else None,
+                url=hotel_url,
+                booking_url=hotel_url,
+                lat=hlat, lon=hlon, distance_km=dist,
+                source=source_name,
+                price_is_live=True,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return hotels
+
+
+# ---------------------------------------------------------------------------
+# Source: Priceline (via RapidAPI)
+# ---------------------------------------------------------------------------
+
+def search_priceline(checkin: str, checkout: str, lat: float, lon: float,
+                     cap_usd: float, nights: int) -> list[Hotel]:
+    key = os.environ.get("RAPIDAPI_KEY", "")
+    if not key:
+        return []
+    return _rapidapi_search(
+        host="priceline-com2.p.rapidapi.com", key=key,
+        checkin=checkin, checkout=checkout, lat=lat, lon=lon,
+        cap_usd=cap_usd, nights=nights,
+        source_name="priceline", site_url="https://www.priceline.com",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source: Expedia (via RapidAPI)
+# ---------------------------------------------------------------------------
+
+def search_expedia(checkin: str, checkout: str, lat: float, lon: float,
+                   cap_usd: float, nights: int) -> list[Hotel]:
+    key = os.environ.get("RAPIDAPI_KEY", "")
+    if not key:
+        return []
+    return _rapidapi_search(
+        host="expedia-com2.p.rapidapi.com", key=key,
+        checkin=checkin, checkout=checkout, lat=lat, lon=lon,
+        cap_usd=cap_usd, nights=nights,
+        source_name="expedia", site_url="https://www.expedia.com",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
 SOURCES = {
-    "rapidapi": ("RapidAPI / Booking.com", search_rapidapi),
+    "booking": ("Booking.com", search_rapidapi),
+    "priceline": ("Priceline", search_priceline),
+    "expedia": ("Expedia", search_expedia),
     "amadeus": ("Amadeus API", search_amadeus),
-    "booking": ("Booking.com scraper", search_booking),
+    "booking-scraper": ("Booking.com scraper", search_booking),
     "hotelsdotcom": ("Hotels.com scraper", search_hotelsdotcom),
     "curated": ("Curated estimates", search_curated),
 }
 
-_DEFAULT_ORDER = ["rapidapi", "amadeus", "booking", "hotelsdotcom", "curated"]
+_DEFAULT_ORDER = ["booking", "priceline", "expedia", "amadeus", "booking-scraper", "hotelsdotcom", "curated"]
 
 
 def find_hotels(checkin: str, checkout: str, location: str,
@@ -1131,12 +1315,12 @@ def format_results(hotels: list[Hotel], cap_usd: float, nights: int,
     over = [h for h in hotels if h.price_per_night > cap_usd]
 
     if within:
-        lines.append(f"\n  WITHIN ${cap_usd:.0f}/NIGHT CAP\n")
+        lines.append(f"\n  WITHIN ${cap_usd:.0f}/NIGHT CAP  (all taxes & fees included)\n")
         for i, h in enumerate(within, 1):
             lines.extend(_fmt(i, h, nights))
 
     if over:
-        lines.append(f"\n  OVER CAP — CREDIT-WORTHY  (${cap_usd:.0f}–${cap_usd*1.3:.0f}/night)\n")
+        lines.append(f"\n  OVER CAP — USE YOUR CREDITS  (${cap_usd:.0f}–${cap_usd*1.3:.0f}/night all-in)\n")
         for i, h in enumerate(over, 1):
             lines.extend(_fmt(len(within) + i, h, nights))
 
@@ -1179,50 +1363,56 @@ def _fmt(rank: int, h: Hotel, nights: int) -> list[str]:
 def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
     """Dump raw HTTP response so we can see what the site is actually returning."""
 
-    if source == "rapidapi":
+    # RapidAPI sources
+    rapidapi_hosts = {
+        "booking": "booking-com15.p.rapidapi.com",
+        "priceline": "priceline-com2.p.rapidapi.com",
+        "expedia": "expedia-com2.p.rapidapi.com",
+    }
+    if source in rapidapi_hosts:
         key = os.environ.get("RAPIDAPI_KEY", "")
         if not key:
             print("RAPIDAPI_KEY not set")
             return
-        headers = {
-            "x-rapidapi-key": key,
-            "x-rapidapi-host": "booking-com15.p.rapidapi.com",
-        }
-        # Step 1: destination search
-        print("=== Step 1: searchDestination ===")
-        for query in ["Chelsea, New York", "New York City"]:
-            r = std_requests.get(
-                "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination",
-                headers=headers,
-                params={"query": query, "languagecode": "en-us"},
-                timeout=30,
-            )
-            print(f"Query: {query!r}  →  HTTP {r.status_code}")
-            print(r.text[:2000])
-            print()
+        host = rapidapi_hosts[source]
+        headers = {"x-rapidapi-key": key, "x-rapidapi-host": host}
 
-        # Step 2: hotel search with a known good dest_id for Manhattan
-        print("=== Step 2: searchHotels (dest_id=-2140479 = Manhattan) ===")
-        r = std_requests.get(
-            "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",
-            headers=headers,
-            params={
-                "dest_id": "-2140479",  # Manhattan fallback
-                "search_type": "CITY",
-                "arrival_date": checkin,
-                "departure_date": checkout,
-                "adults": "1",
-                "room_qty": "1",
-                "page_number": "1",
-                "languagecode": "en-us",
-                "currency_code": "USD",
-            },
-            timeout=60,
-        )
-        print(f"HTTP {r.status_code}  ({len(r.text)} chars)")
-        print(r.text[:3000])
+        if source == "booking":
+            print("=== searchDestination ===")
+            for query in ["Chelsea, New York", "New York City"]:
+                r = std_requests.get(
+                    f"https://{host}/api/v1/hotels/searchDestination",
+                    headers=headers, params={"query": query, "languagecode": "en-us"}, timeout=30,
+                )
+                print(f"{query!r} → HTTP {r.status_code}\n{r.text[:1500]}\n")
+            print("=== searchHotels (Chelsea dest_id=966) ===")
+            r = std_requests.get(
+                f"https://{host}/api/v1/hotels/searchHotels",
+                headers=headers,
+                params={"dest_id": "966", "search_type": "DISTRICT",
+                        "arrival_date": checkin, "departure_date": checkout,
+                        "adults": "1", "room_qty": "1", "languagecode": "en-us", "currency_code": "USD"},
+                timeout=60,
+            )
+        else:
+            # Priceline / Expedia: probe all endpoint variants
+            for endpoint in ["/api/hotel/search", "/v2/hotel/search", "/hotels/search"]:
+                print(f"=== GET https://{host}{endpoint} ===")
+                r = std_requests.get(
+                    f"https://{host}{endpoint}",
+                    headers=headers,
+                    params={"check_in_date": checkin, "check_out_date": checkout,
+                            "city_name": "New York", "country_code": "US",
+                            "adults": "1", "rooms_number": "1", "currency": "USD"},
+                    timeout=30,
+                )
+                print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:1500]}\n")
+            return
+
+        print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:3000]}")
         return
 
+    # Curl-cffi scrapers
     if not CFFI_AVAILABLE:
         print("curl_cffi not available")
         return
@@ -1230,7 +1420,7 @@ def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
     ci = datetime.strptime(checkin, "%Y-%m-%d")
     co = datetime.strptime(checkout, "%Y-%m-%d")
 
-    if source == "booking":
+    if source == "booking-scraper":
         url = "https://www.booking.com/searchresults.html"
         params = {
             "latitude": 40.7422, "longitude": -74.0041,
@@ -1298,7 +1488,7 @@ Examples:
                         help="Dump raw response body for debugging scrapers")
     args = parser.parse_args()
 
-    if args.debug and args.source in ("booking", "hotelsdotcom", "rapidapi"):
+    if args.debug and args.source in SOURCES:
         _debug_scrape(args.source, args.checkin, args.checkout)
         return
 
