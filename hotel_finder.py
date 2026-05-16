@@ -1181,6 +1181,302 @@ def search_priceline(checkin: str, checkout: str, lat: float, lon: float,
 
 
 # ---------------------------------------------------------------------------
+# Source: Sky Scrapper (via RapidAPI) — aggregates Booking, Hotels.com, etc.
+# ---------------------------------------------------------------------------
+
+def _sky_scrapper_entity_id(key: str) -> Optional[str]:
+    headers = {"x-rapidapi-key": key, "x-rapidapi-host": "sky-scrapper.p.rapidapi.com"}
+    try:
+        r = std_requests.get(
+            "https://sky-scrapper.p.rapidapi.com/api/v1/hotels/searchDestination",
+            headers=headers,
+            params={"query": "Chelsea, New York"},
+            timeout=20,
+        )
+        if r.ok:
+            for item in r.json().get("data", []):
+                if item.get("entityType") in ("city", "district", "neighborhood", "place"):
+                    return str(item.get("entityId", ""))
+            data = r.json().get("data", [])
+            if data:
+                return str(data[0].get("entityId", ""))
+    except Exception:
+        pass
+    return None
+
+
+def search_skyscrapper(checkin: str, checkout: str, lat: float, lon: float,
+                       cap_usd: float, nights: int) -> list[Hotel]:
+    key = os.environ.get("RAPIDAPI_KEY", "")
+    if not key:
+        return []
+    headers = {"x-rapidapi-key": key, "x-rapidapi-host": "sky-scrapper.p.rapidapi.com"}
+
+    entity_id = _sky_scrapper_entity_id(key)
+    if not entity_id:
+        return []
+
+    try:
+        r = std_requests.get(
+            "https://sky-scrapper.p.rapidapi.com/api/v1/hotels/searchHotels",
+            headers=headers,
+            params={"entityId": entity_id, "checkin": checkin, "checkout": checkout,
+                    "adults": "1", "rooms": "1", "currency": "USD",
+                    "countryCode": "US", "market": "en-US"},
+            timeout=40,
+        )
+        if not r.ok:
+            print(f"    sky-scrapper {r.status_code}", file=sys.stderr)
+            return []
+        data = r.json()
+    except Exception as e:
+        print(f"    sky-scrapper error: {e}", file=sys.stderr)
+        return []
+
+    hotels = []
+    for item in data.get("data", {}).get("hotels", []) or data.get("data", []) or []:
+        try:
+            name = item.get("name") or item.get("hotel", {}).get("name", "")
+            if not name:
+                continue
+            pb = item.get("price", {}) or item.get("hotel", {}).get("price", {})
+            total = (
+                _f(pb.get("totalPrice")) or _f(pb.get("total"))
+                or _f(pb.get("lead", {}).get("amount")) * nights
+                or 0.0
+            )
+            if total == 0:
+                continue
+            per_night = total / nights
+            if per_night > cap_usd * 1.30:
+                continue
+            coord = item.get("coordinates", item.get("hotel", {}).get("coordinates", {}))
+            hlat = _f(coord.get("latitude")) or None
+            hlon = _f(coord.get("longitude")) or None
+            dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
+            hotel_url = item.get("url") or item.get("hotel", {}).get("url") or booking_search_url(name, checkin, checkout)
+            if hotel_url and not hotel_url.startswith("http"):
+                hotel_url = "https://www.skyscanner.com" + hotel_url
+            hotels.append(Hotel(
+                name=name,
+                price_per_night=per_night,
+                total_price=total,
+                currency="USD",
+                address=item.get("neighborhood") or item.get("address") or "",
+                stars=_f(item.get("stars") or item.get("starRating")) or None,
+                rating=_f(item.get("reviewScore") or item.get("rating")) or None,
+                url=hotel_url, booking_url=hotel_url,
+                lat=hlat, lon=hlon, distance_km=dist,
+                source="skyscanner", price_is_live=True,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return hotels
+
+
+# ---------------------------------------------------------------------------
+# Source: TripAdvisor (via RapidAPI)
+# ---------------------------------------------------------------------------
+
+def _tripadvisor_geo_id(key: str) -> Optional[str]:
+    headers = {"x-rapidapi-key": key, "x-rapidapi-host": "tripadvisor16.p.rapidapi.com"}
+    for query in ["Chelsea New York", "New York City"]:
+        try:
+            r = std_requests.get(
+                "https://tripadvisor16.p.rapidapi.com/api/v1/hotels/searchLocation",
+                headers=headers,
+                params={"query": query},
+                timeout=20,
+            )
+            if r.ok:
+                data = r.json().get("data", [])
+                if isinstance(data, list) and data:
+                    return str(data[0].get("geoId") or data[0].get("locationId", ""))
+                elif isinstance(data, dict):
+                    items = data.get("results", [])
+                    if items:
+                        return str(items[0].get("geoId", ""))
+        except Exception:
+            continue
+    return None
+
+
+def search_tripadvisor(checkin: str, checkout: str, lat: float, lon: float,
+                       cap_usd: float, nights: int) -> list[Hotel]:
+    key = os.environ.get("RAPIDAPI_KEY", "")
+    if not key:
+        return []
+    headers = {"x-rapidapi-key": key, "x-rapidapi-host": "tripadvisor16.p.rapidapi.com"}
+
+    geo_id = _tripadvisor_geo_id(key)
+    if not geo_id:
+        print("    tripadvisor: could not resolve geoId", file=sys.stderr)
+        return []
+
+    try:
+        r = std_requests.get(
+            "https://tripadvisor16.p.rapidapi.com/api/v1/hotels/searchHotels",
+            headers=headers,
+            params={"geoId": geo_id, "checkIn": checkin, "checkOut": checkout,
+                    "adults": "1", "rooms": "1", "currencyCode": "USD",
+                    "nights": str(nights)},
+            timeout=40,
+        )
+        if not r.ok:
+            print(f"    tripadvisor {r.status_code}", file=sys.stderr)
+            return []
+        data = r.json()
+    except Exception as e:
+        print(f"    tripadvisor error: {e}", file=sys.stderr)
+        return []
+
+    hotels = []
+    items = (data.get("data", {}).get("data", [])
+             or data.get("data", []) or [])
+    for item in items:
+        try:
+            name = item.get("title") or item.get("name") or item.get("cardTitle", {}).get("string", "")
+            if not name:
+                continue
+            price_section = item.get("priceDetails") or item.get("commerceInfo", {})
+            total = (
+                _f(price_section.get("priceForDisplay", "").replace("$", "").replace(",", ""))
+                or _f(price_section.get("totalPrice"))
+                or 0.0
+            )
+            # TripAdvisor often returns per-night price
+            if total > 0 and total < 1000:
+                total = total * nights
+            if total == 0:
+                continue
+            per_night = total / nights
+            if per_night > cap_usd * 1.30:
+                continue
+            geo = item.get("geoPoint", item.get("location", {}))
+            hlat = _f(geo.get("lat") or geo.get("latitude")) or None
+            hlon = _f(geo.get("lon") or geo.get("longitude")) or None
+            dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
+            hotel_url = item.get("commerceInfo", {}).get("externalUrl") or item.get("detailsHref", "")
+            if hotel_url and not hotel_url.startswith("http"):
+                hotel_url = "https://www.tripadvisor.com" + hotel_url
+            if not hotel_url:
+                hotel_url = booking_search_url(name, checkin, checkout)
+            hotels.append(Hotel(
+                name=name,
+                price_per_night=per_night,
+                total_price=per_night * nights,
+                currency="USD",
+                address=item.get("secondaryInfo", "") or "",
+                stars=_f(item.get("accentedLabel", "").replace(" of 5 bubbles", "")) or None,
+                rating=_f(item.get("bubbleRating", {}).get("rating")) or None,
+                url=hotel_url, booking_url=hotel_url,
+                lat=hlat, lon=hlon, distance_km=dist,
+                source="tripadvisor", price_is_live=True,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return hotels
+
+
+# ---------------------------------------------------------------------------
+# Source: Hotels.com Provider (via RapidAPI)
+# ---------------------------------------------------------------------------
+
+def search_hotelsdotcom_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
+                                  cap_usd: float, nights: int) -> list[Hotel]:
+    key = os.environ.get("RAPIDAPI_KEY", "")
+    if not key:
+        return []
+    headers = {"x-rapidapi-key": key, "x-rapidapi-host": "hotels-com-provider.p.rapidapi.com"}
+
+    # Resolve destination ID
+    dest_id = None
+    try:
+        r = std_requests.get(
+            "https://hotels-com-provider.p.rapidapi.com/v2/regions",
+            headers=headers,
+            params={"query": "Chelsea New York", "domain": "US", "locale": "en_US"},
+            timeout=20,
+        )
+        if r.ok:
+            for region in r.json().get("data", []):
+                if region.get("type") in ("CITY", "NEIGHBORHOOD", "POI"):
+                    dest_id = str(region.get("gaiaId") or region.get("id", ""))
+                    break
+    except Exception:
+        pass
+
+    if not dest_id:
+        return _rapidapi_search(
+            host="hotels-com-provider.p.rapidapi.com", key=key,
+            checkin=checkin, checkout=checkout, lat=lat, lon=lon,
+            cap_usd=cap_usd, nights=nights,
+            source_name="hotels.com", site_url="https://www.hotels.com",
+        )
+
+    try:
+        r = std_requests.get(
+            "https://hotels-com-provider.p.rapidapi.com/v2/hotels/search",
+            headers=headers,
+            params={"region_id": dest_id, "checkin_date": checkin, "checkout_date": checkout,
+                    "adults_number": "1", "rooms_number": "1",
+                    "currency": "USD", "locale": "en_US",
+                    "sort_order": "REVIEW", "domain": "US"},
+            timeout=40,
+        )
+        if not r.ok:
+            print(f"    hotels.com provider {r.status_code}", file=sys.stderr)
+            return []
+        data = r.json()
+    except Exception as e:
+        print(f"    hotels.com provider error: {e}", file=sys.stderr)
+        return []
+
+    hotels = []
+    for item in data.get("data", {}).get("body", {}).get("searchResults", {}).get("results", []) or []:
+        try:
+            name = item.get("name", "")
+            if not name:
+                continue
+            price_info = item.get("ratePlan", {}).get("price", {})
+            total = (
+                _f(price_info.get("exactCurrent"))
+                or _f(price_info.get("current", "").replace("$", "").replace(",", ""))
+                or 0.0
+            )
+            if total == 0:
+                continue
+            # hotels.com price is typically per-night
+            if total < 1000:
+                total = total * nights
+            per_night = total / nights
+            if per_night > cap_usd * 1.30:
+                continue
+            coord = item.get("coordinate", {})
+            hlat = _f(coord.get("lat")) or None
+            hlon = _f(coord.get("lon")) or None
+            dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
+            hotel_id = item.get("id", "")
+            hotel_url = (f"https://www.hotels.com/ho{hotel_id}/"
+                         if hotel_id else booking_search_url(name, checkin, checkout))
+            hotels.append(Hotel(
+                name=name,
+                price_per_night=per_night,
+                total_price=per_night * nights,
+                currency="USD",
+                address=item.get("address", {}).get("streetAddress", ""),
+                stars=_f(item.get("starRating")) or None,
+                rating=_f(item.get("guestReviews", {}).get("rating")) or None,
+                url=hotel_url, booking_url=hotel_url,
+                lat=hlat, lon=hlon, distance_km=dist,
+                source="hotels.com", price_is_live=True,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return hotels
+
+
+# ---------------------------------------------------------------------------
 # Source: Expedia (via RapidAPI)
 # ---------------------------------------------------------------------------
 
@@ -1204,13 +1500,15 @@ def search_expedia(checkin: str, checkout: str, lat: float, lon: float,
 SOURCES = {
     "booking": ("Booking.com", search_rapidapi),
     "priceline": ("Priceline", search_priceline),
+    "skyscrapper": ("Sky Scrapper", search_skyscrapper),
+    "tripadvisor": ("TripAdvisor", search_tripadvisor),
+    "hotelsdotcom": ("Hotels.com", search_hotelsdotcom_rapidapi),
     "amadeus": ("Amadeus API", search_amadeus),
     "booking-scraper": ("Booking.com scraper", search_booking),
-    "hotelsdotcom": ("Hotels.com scraper", search_hotelsdotcom),
     "curated": ("Curated estimates", search_curated),
 }
 
-_DEFAULT_ORDER = ["booking", "priceline", "amadeus", "booking-scraper", "hotelsdotcom", "curated"]
+_DEFAULT_ORDER = ["booking", "priceline", "skyscrapper", "tripadvisor", "hotelsdotcom", "amadeus", "curated"]
 
 
 def find_hotels(checkin: str, checkout: str, location: str,
@@ -1366,7 +1664,9 @@ def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
     rapidapi_hosts = {
         "booking": "booking-com15.p.rapidapi.com",
         "priceline": "priceline-com2.p.rapidapi.com",
-        "expedia": "expedia-com2.p.rapidapi.com",
+        "skyscrapper": "sky-scrapper.p.rapidapi.com",
+        "tripadvisor": "tripadvisor16.p.rapidapi.com",
+        "hotelsdotcom": "hotels-com-provider.p.rapidapi.com",
     }
     if source in rapidapi_hosts:
         key = os.environ.get("RAPIDAPI_KEY", "")
@@ -1394,18 +1694,32 @@ def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
                 timeout=60,
             )
         else:
-            # Priceline / Expedia: probe all endpoint variants
-            for endpoint in ["/api/hotel/search", "/v2/hotel/search", "/hotels/search"]:
-                print(f"=== GET https://{host}{endpoint} ===")
-                r = std_requests.get(
-                    f"https://{host}{endpoint}",
-                    headers=headers,
-                    params={"check_in_date": checkin, "check_out_date": checkout,
-                            "city_name": "New York", "country_code": "US",
-                            "adults": "1", "rooms_number": "1", "currency": "USD"},
-                    timeout=30,
-                )
-                print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:1500]}\n")
+            # For new sources: probe common endpoint/param variants and dump response
+            endpoint_variants = [
+                "/api/v1/hotels/searchHotels", "/api/v1/hotels/search",
+                "/api/hotel/search", "/v2/hotel/search", "/hotels/search",
+                "/v2/hotels/search", "/v2/regions",
+            ]
+            param_variants = [
+                {"query": "Chelsea New York", "checkIn": checkin, "checkOut": checkout,
+                 "adults": "1", "rooms": "1", "currency": "USD"},
+                {"check_in_date": checkin, "check_out_date": checkout,
+                 "city_name": "New York", "country_code": "US",
+                 "adults": "1", "rooms_number": "1", "currency": "USD"},
+                {"query": "Chelsea New York", "domain": "US", "locale": "en_US"},
+            ]
+            for endpoint in endpoint_variants:
+                for params in param_variants[:1]:  # just first param shape per endpoint
+                    try:
+                        r = std_requests.get(f"https://{host}{endpoint}",
+                                             headers=headers, params=params, timeout=25)
+                        print(f"=== {endpoint} → HTTP {r.status_code} ({len(r.text)} chars) ===")
+                        print(r.text[:800])
+                        print()
+                        if r.ok:
+                            break
+                    except Exception as e:
+                        print(f"=== {endpoint} → ERROR: {e} ===\n")
             return
 
         print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:3000]}")
