@@ -220,10 +220,8 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
         return []
 
     # Step 1: get destination ID for the location
-    dest_id = _rapidapi_dest_id(lat, lon, key)
-    if not dest_id:
-        print("    could not resolve destination ID", file=sys.stderr)
-        return []
+    dest_id, search_type = _rapidapi_dest_id(key)
+    print(f"    dest_id={dest_id!r} search_type={search_type!r}", file=sys.stderr)
 
     # Step 2: search hotels
     headers = {
@@ -232,7 +230,7 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
     }
     params = {
         "dest_id": dest_id,
-        "search_type": "CITY",
+        "search_type": search_type,
         "arrival_date": checkin,
         "departure_date": checkout,
         "adults": "1",
@@ -263,6 +261,8 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
 
     hotels = []
     items = data.get("data", {}).get("hotels", []) or []
+    print(f"    raw items from API: {len(items)}", file=sys.stderr)
+
     for item in items:
         try:
             prop = item.get("property", {})
@@ -270,25 +270,30 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
             if not name:
                 continue
 
-            # Price
-            price_info = prop.get("priceBreakdown", {})
-            gross = price_info.get("grossPrice", {})
-            total = float(gross.get("value", 0))
-            if total == 0:
-                # try alternative path
-                total = float(item.get("priceDisplayInfo", {})
-                               .get("displayPrice", {})
-                               .get("amountPerStay", {})
-                               .get("amountRounded", 0) or 0)
+            # Try every known price field path across booking-com15 API versions
+            pb = prop.get("priceBreakdown", {})
+            gross = pb.get("grossPrice", {})
+            total = (
+                _f(gross.get("value"))
+                or _f(gross.get("amount"))
+                or _f(pb.get("allInclusiveAmount", {}).get("value"))
+                or _f(item.get("priceDisplayInfo", {})
+                        .get("displayPrice", {})
+                        .get("amountPerStay", {})
+                        .get("amountRounded"))
+                or _f(prop.get("price"))
+                or 0.0
+            )
             if total == 0:
                 continue
 
+            # API returns total-stay price; divide by nights
             per_night = total / nights
             if per_night > cap_usd * 1.30:
                 continue
 
-            hlat = float(prop.get("latitude", 0)) or None
-            hlon = float(prop.get("longitude", 0)) or None
+            hlat = float(prop.get("latitude") or 0) or None
+            hlon = float(prop.get("longitude") or 0) or None
             dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
 
             hotel_id = prop.get("id") or item.get("hotel_id", "")
@@ -296,12 +301,13 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
                    f"?checkin={checkin}&checkout={checkout}&group_adults=1&no_rooms=1"
                    if hotel_id else booking_search_url(name, checkin, checkout))
 
+            currency = gross.get("currency") or "USD"
             hotels.append(Hotel(
                 name=name,
                 price_per_night=per_night,
                 total_price=total,
-                currency=gross.get("currency", "USD"),
-                address=prop.get("wishlistName", "") or prop.get("countryCode", ""),
+                currency=currency,
+                address=prop.get("wishlistName", "") or "",
                 stars=prop.get("propertyClass"),
                 rating=prop.get("reviewScore"),
                 url=url,
@@ -316,33 +322,38 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
     return hotels
 
 
-def _rapidapi_dest_id(lat: float, lon: float, key: str) -> Optional[str]:
-    """Resolve a lat/lon to a Booking.com destination ID via RapidAPI."""
+def _f(v) -> float:
+    """Safe float conversion, returns 0.0 on failure."""
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rapidapi_dest_id(key: str) -> tuple[str, str]:
+    """Return (dest_id, search_type) for Chelsea NY, falling back to Manhattan."""
     headers = {
         "x-rapidapi-key": key,
         "x-rapidapi-host": "booking-com15.p.rapidapi.com",
     }
-    # Try searching for "Chelsea New York" as the destination
     for query in ["Chelsea, New York", "New York City"]:
         try:
             r = std_requests.get(
                 "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination",
                 headers=headers,
                 params={"query": query, "languagecode": "en-us"},
-                timeout=10,
+                timeout=30,
             )
             if not r.ok:
                 continue
-            results = r.json().get("data", [])
-            # Prefer city-type results
-            for res in results:
-                if res.get("search_type") in ("city", "district", "landmark"):
-                    return str(res.get("dest_id", ""))
-            if results:
-                return str(results[0].get("dest_id", ""))
+            for res in r.json().get("data", []):
+                stype = res.get("search_type", "")
+                if stype in ("city", "district", "landmark", "region"):
+                    return str(res["dest_id"]), stype.upper()
         except Exception:
             continue
-    return None
+    # Manhattan hardcoded fallback
+    return "-2140479", "CITY"
 
 
 # ---------------------------------------------------------------------------
