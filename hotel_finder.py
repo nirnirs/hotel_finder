@@ -1161,6 +1161,51 @@ def _fmt(rank: int, h: Hotel, nights: int) -> list[str]:
 
 def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
     """Dump raw HTTP response so we can see what the site is actually returning."""
+
+    if source == "rapidapi":
+        key = os.environ.get("RAPIDAPI_KEY", "")
+        if not key:
+            print("RAPIDAPI_KEY not set")
+            return
+        headers = {
+            "x-rapidapi-key": key,
+            "x-rapidapi-host": "booking-com15.p.rapidapi.com",
+        }
+        # Step 1: destination search
+        print("=== Step 1: searchDestination ===")
+        for query in ["Chelsea, New York", "New York City"]:
+            r = std_requests.get(
+                "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination",
+                headers=headers,
+                params={"query": query, "languagecode": "en-us"},
+                timeout=30,
+            )
+            print(f"Query: {query!r}  →  HTTP {r.status_code}")
+            print(r.text[:2000])
+            print()
+
+        # Step 2: hotel search with a known good dest_id for Manhattan
+        print("=== Step 2: searchHotels (dest_id=-2140479 = Manhattan) ===")
+        r = std_requests.get(
+            "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",
+            headers=headers,
+            params={
+                "dest_id": "-2140479",  # Manhattan fallback
+                "search_type": "CITY",
+                "arrival_date": checkin,
+                "departure_date": checkout,
+                "adults": "1",
+                "room_qty": "1",
+                "page_number": "1",
+                "languagecode": "en-us",
+                "currency_code": "USD",
+            },
+            timeout=60,
+        )
+        print(f"HTTP {r.status_code}  ({len(r.text)} chars)")
+        print(r.text[:3000])
+        return
+
     if not CFFI_AVAILABLE:
         print("curl_cffi not available")
         return
@@ -1236,7 +1281,7 @@ Examples:
                         help="Dump raw response body for debugging scrapers")
     args = parser.parse_args()
 
-    if args.debug and args.source in ("booking", "hotelsdotcom"):
+    if args.debug and args.source in ("booking", "hotelsdotcom", "rapidapi"):
         _debug_scrape(args.source, args.checkin, args.checkout)
         return
 
