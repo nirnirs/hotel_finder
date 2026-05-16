@@ -532,25 +532,58 @@ def search_booking(checkin: str, checkout: str, lat: float, lon: float,
         "nflt": "ht_id%3D204",  # hotel property type
     }
 
-    try:
-        r = cffi_requests.get(
-            "https://www.booking.com/searchresults.html",
-            params=params,
-            headers=_CHROME_HEADERS,
-            cookies=cookies,
-            impersonate="chrome110",
-            allow_redirects=True,
-            timeout=25,
-        )
-    except Exception as e:
-        print(f"    booking request error: {e}", file=sys.stderr)
+    html = None
+    for attempt in range(3):
+        try:
+            r = cffi_requests.get(
+                "https://www.booking.com/searchresults.html",
+                params=params,
+                headers=_CHROME_HEADERS,
+                cookies=cookies,
+                impersonate="chrome110",
+                allow_redirects=True,
+                timeout=30,
+            )
+        except Exception as e:
+            print(f"    booking request error: {e}", file=sys.stderr)
+            return []
+
+        if r.status_code == 200:
+            html = r.text
+            break
+        elif r.status_code == 202:
+            # Booking.com async processing — follow Location header or re-request
+            location = r.headers.get("Location") or r.headers.get("location")
+            if location:
+                try:
+                    r2 = cffi_requests.get(
+                        location if location.startswith("http") else "https://www.booking.com" + location,
+                        headers=_CHROME_HEADERS,
+                        cookies={**cookies, **r.cookies},
+                        impersonate="chrome110",
+                        allow_redirects=True,
+                        timeout=30,
+                    )
+                    if r2.status_code == 200:
+                        html = r2.text
+                        break
+                except Exception:
+                    pass
+            # Try parsing the 202 body anyway — sometimes results are embedded
+            if r.text and len(r.text) > 1000:
+                html = r.text
+                break
+            import time as _time
+            _time.sleep(2)
+        else:
+            print(f"    booking HTTP {r.status_code}", file=sys.stderr)
+            return []
+
+    if not html:
+        print("    booking: no usable response after retries", file=sys.stderr)
         return []
 
-    if not r or r.status_code != 200:
-        print(f"    booking HTTP {r.status_code if r else 'no response'}", file=sys.stderr)
-        return []
-
-    return _parse_booking(r.text, lat, lon, nights, cap_usd, checkin, checkout)
+    return _parse_booking(html, lat, lon, nights, cap_usd, checkin, checkout)
 
 
 def _parse_booking(html: str, ref_lat: float, ref_lon: float,
@@ -668,32 +701,35 @@ def search_hotelsdotcom(checkin: str, checkout: str, lat: float, lon: float,
     checkin_parts = checkin.split("-")
     checkout_parts = checkout.split("-")
 
-    search_url = (
-        f"https://www.hotels.com/search?q-destination=Chelsea+New+York"
-        f"&q-check-in={checkin}&q-check-out={checkout}"
-        f"&q-rooms=1&q-room-0-adults=1"
-    )
+    # Try multiple Hotels.com URL patterns (they restructure frequently)
+    candidates = [
+        f"https://www.hotels.com/search?q-destination=Chelsea+New+York&q-check-in={checkin}&q-check-out={checkout}&q-rooms=1&q-room-0-adults=1",
+        f"https://www.hotels.com/Hotel-Search?destination=Chelsea+New+York&startDate={checkin}&endDate={checkout}&adults=1&rooms=1",
+        f"https://www.hotels.com/search?destination=Chelsea%2C+New+York&startDate={checkin}&endDate={checkout}&rooms=1&adults=1",
+    ]
     if region_id:
-        search_url = (
-            f"https://www.hotels.com/search?regionId={region_id}"
-            f"&q-check-in={checkin}&q-check-out={checkout}"
-            f"&q-rooms=1&q-room-0-adults=1"
+        candidates.insert(0,
+            f"https://www.hotels.com/search?regionId={region_id}&q-check-in={checkin}&q-check-out={checkout}&q-rooms=1&q-room-0-adults=1"
         )
 
-    try:
-        r = cffi_requests.get(
-            search_url,
-            headers=_CHROME_HEADERS,
-            impersonate="chrome110",
-            allow_redirects=True,
-            timeout=25,
-        )
-    except Exception as e:
-        print(f"    hotels.com error: {e}", file=sys.stderr)
-        return []
+    r = None
+    for url in candidates:
+        try:
+            r = cffi_requests.get(
+                url,
+                headers=_CHROME_HEADERS,
+                impersonate="chrome110",
+                allow_redirects=True,
+                timeout=25,
+            )
+            if r and r.status_code == 200:
+                break
+            print(f"    hotels.com {r.status_code if r else 'err'} → {url[:60]}", file=sys.stderr)
+        except Exception as e:
+            print(f"    hotels.com error: {e}", file=sys.stderr)
 
     if not r or r.status_code != 200:
-        print(f"    hotels.com HTTP {r.status_code if r else 'no response'}", file=sys.stderr)
+        print(f"    hotels.com: no usable response from any URL", file=sys.stderr)
         return []
 
     return _parse_hotelsdotcom(r.text, lat, lon, nights, cap_usd, checkin, checkout)
@@ -1120,6 +1156,44 @@ def _fmt(rank: int, h: Hotel, nights: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Debug helper
+# ---------------------------------------------------------------------------
+
+def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
+    """Dump raw HTTP response so we can see what the site is actually returning."""
+    if not CFFI_AVAILABLE:
+        print("curl_cffi not available")
+        return
+
+    ci = datetime.strptime(checkin, "%Y-%m-%d")
+    co = datetime.strptime(checkout, "%Y-%m-%d")
+
+    if source == "booking":
+        url = "https://www.booking.com/searchresults.html"
+        params = {
+            "latitude": 40.7422, "longitude": -74.0041,
+            "checkin_year": ci.year, "checkin_month": ci.month, "checkin_monthday": ci.day,
+            "checkout_year": co.year, "checkout_month": co.month, "checkout_monthday": co.day,
+            "group_adults": 1, "no_rooms": 1, "selected_currency": "USD",
+        }
+    else:
+        url = "https://www.hotels.com/search"
+        params = {"q-destination": "Chelsea New York",
+                  "q-check-in": checkin, "q-check-out": checkout,
+                  "q-rooms": 1, "q-room-0-adults": 1}
+
+    print(f"GET {url}")
+    try:
+        r = cffi_requests.get(url, params=params, headers=_CHROME_HEADERS,
+                              impersonate="chrome110", allow_redirects=True, timeout=30)
+        print(f"Status: {r.status_code}")
+        print(f"Headers: {dict(r.headers)}")
+        print(f"Body ({len(r.text)} chars):\n{r.text[:3000]}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1158,7 +1232,13 @@ Examples:
                         help="Force a specific source: rapidapi | amadeus | booking | hotelsdotcom | curated")
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--debug", action="store_true",
+                        help="Dump raw response body for debugging scrapers")
     args = parser.parse_args()
+
+    if args.debug and args.source in ("booking", "hotelsdotcom"):
+        _debug_scrape(args.source, args.checkin, args.checkout)
+        return
 
     hotels = find_hotels(
         checkin=args.checkin,
