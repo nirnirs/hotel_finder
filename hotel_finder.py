@@ -1074,7 +1074,8 @@ def _parse_generic_rapidapi(data: dict, lat: float, lon: float,
                              source_name: str, site_url: str) -> list[Hotel]:
     """Walk common hotel list shapes in RapidAPI responses."""
     candidates: list[dict] = []
-    for path in [["data", "hotels"], ["data", "results"], ["hotels"], ["results"], ["data"]]:
+    for path in [["data", "hotels"], ["data", "data", "hotels"], ["data", "data"],
+                 ["data", "results"], ["hotels"], ["results"], ["data"]]:
         obj = data
         for k in path:
             obj = obj.get(k) if isinstance(obj, dict) else None
@@ -1095,17 +1096,23 @@ def _parse_generic_rapidapi(data: dict, lat: float, lon: float,
             if not name:
                 continue
 
-            # All-inclusive total (taxes+fees), walk many schemas
+            # All-inclusive total (taxes+fees), walk many schemas.
+            # Paths marked PER_NIGHT will be multiplied by nights.
             total = 0.0
-            for path in [
-                ["property", "priceBreakdown", "allInclusiveAmount", "value"],
-                ["property", "priceBreakdown", "grossPrice", "value"],
-                ["price", "total_inclusive"],
-                ["price", "totalPrice"],
-                ["price", "total"],
-                ["totalPrice"],
-                ["rate_info", "display_all_in_total"],
-                ["price_details", "display_total"],
+            for path, is_per_night in [
+                (["property", "priceBreakdown", "allInclusiveAmount", "value"], False),
+                (["property", "priceBreakdown", "grossPrice", "value"], False),
+                (["price", "total_inclusive"], False),
+                (["price", "totalPrice"], False),
+                (["price", "total"], False),
+                (["totalPrice"], False),
+                (["rate_info", "display_all_in_total"], False),
+                (["price_details", "display_total"], False),
+                # per-night fields (Sky Scrapper / generic)
+                (["price", "lead", "amount"], True),
+                (["price", "perNight"], True),
+                (["pricePerNight"], True),
+                (["price", "amount"], True),
             ]:
                 obj = item
                 for k in path:
@@ -1114,7 +1121,8 @@ def _parse_generic_rapidapi(data: dict, lat: float, lon: float,
                         break
                 if obj is not None:
                     try:
-                        total = float(obj)
+                        val = float(obj)
+                        total = val * nights if is_per_night else val
                         break
                     except (ValueError, TypeError):
                         pass
@@ -1238,15 +1246,17 @@ def search_skyscrapper(checkin: str, checkout: str, lat: float, lon: float,
         return []
 
     hotels = []
-    for item in data.get("data", {}).get("hotels", []) or data.get("data", []) or []:
+    for item in (data.get("data", {}).get("hotels", [])
+                 or data.get("data", []) or []):
         try:
             name = item.get("name") or item.get("hotel", {}).get("name", "")
             if not name:
                 continue
-            pb = item.get("price", {}) or item.get("hotel", {}).get("price", {})
+            pb = item.get("price", {}) or item.get("hotel", {}).get("price", {}) or {}
+            _lead = _f((pb.get("lead") or {}).get("amount"))
             total = (
                 _f(pb.get("totalPrice")) or _f(pb.get("total"))
-                or _f(pb.get("lead", {}).get("amount")) * nights
+                or (_lead * nights if _lead else 0.0)
                 or 0.0
             )
             if total == 0:
@@ -1275,6 +1285,11 @@ def search_skyscrapper(checkin: str, checkout: str, lat: float, lon: float,
             ))
         except (KeyError, TypeError, ValueError):
             continue
+    if not hotels:
+        hotels = _parse_generic_rapidapi(
+            data, lat, lon, cap_usd, nights, checkin, checkout,
+            "skyscanner", "https://www.skyscanner.com",
+        )
     return hotels
 
 
@@ -1342,14 +1357,19 @@ def search_tripadvisor(checkin: str, checkout: str, lat: float, lon: float,
             name = item.get("title") or item.get("name") or item.get("cardTitle", {}).get("string", "")
             if not name:
                 continue
-            price_section = item.get("priceDetails") or item.get("commerceInfo", {})
+            price_section = item.get("priceDetails") or item.get("commerceInfo", {}) or {}
+            _pfd = price_section.get("priceForDisplay") or ""
+            _pfd_str = str(_pfd).replace("$", "").replace(",", "") if _pfd else ""
             total = (
-                _f(price_section.get("priceForDisplay", "").replace("$", "").replace(",", ""))
+                _f(_pfd_str)
                 or _f(price_section.get("totalPrice"))
+                or _f(price_section.get("displayPrice"))
+                or _f(price_section.get("amount"))
                 or 0.0
             )
-            # TripAdvisor often returns per-night price
-            if total > 0 and total < 1000:
+            # TripAdvisor returns per-night price; multiply to get total for the stay
+            # Guard: if total is already > $1500 it's probably the total, not per-night
+            if 0 < total < 1500:
                 total = total * nights
             if total == 0:
                 continue
@@ -1365,13 +1385,14 @@ def search_tripadvisor(checkin: str, checkout: str, lat: float, lon: float,
                 hotel_url = "https://www.tripadvisor.com" + hotel_url
             if not hotel_url:
                 hotel_url = booking_search_url(name, checkin, checkout)
+            _al = str(item.get("accentedLabel") or "").replace(" of 5 bubbles", "")
             hotels.append(Hotel(
                 name=name,
                 price_per_night=per_night,
                 total_price=per_night * nights,
                 currency="USD",
                 address=item.get("secondaryInfo", "") or "",
-                stars=_f(item.get("accentedLabel", "").replace(" of 5 bubbles", "")) or None,
+                stars=_f(_al) or None,
                 rating=_f(item.get("bubbleRating", {}).get("rating")) or None,
                 url=hotel_url, booking_url=hotel_url,
                 lat=hlat, lon=hlon, distance_km=dist,
@@ -1379,6 +1400,11 @@ def search_tripadvisor(checkin: str, checkout: str, lat: float, lon: float,
             ))
         except (KeyError, TypeError, ValueError):
             continue
+    if not hotels:
+        hotels = _parse_generic_rapidapi(
+            data, lat, lon, cap_usd, nights, checkin, checkout,
+            "tripadvisor", "https://www.tripadvisor.com",
+        )
     return hotels
 
 
@@ -1442,16 +1468,19 @@ def search_hotelsdotcom_rapidapi(checkin: str, checkout: str, lat: float, lon: f
             name = item.get("name", "")
             if not name:
                 continue
-            price_info = item.get("ratePlan", {}).get("price", {})
+            price_info = item.get("ratePlan", {}).get("price", {}) or {}
+            _cur = price_info.get("current") or ""
+            _cur_str = str(_cur).replace("$", "").replace(",", "") if _cur else ""
             total = (
                 _f(price_info.get("exactCurrent"))
-                or _f(price_info.get("current", "").replace("$", "").replace(",", ""))
+                or _f(_cur_str)
+                or _f(price_info.get("totalPriceMessage", "").replace("$", "").replace(",", "") if isinstance(price_info.get("totalPriceMessage"), str) else 0)
                 or 0.0
             )
             if total == 0:
                 continue
-            # hotels.com price is typically per-night
-            if total < 1000:
+            # hotels.com typically returns per-night; if total already looks like a full-stay price skip multiplying
+            if 0 < total < 1500:
                 total = total * nights
             per_night = total / nights
             if per_night > cap_usd * 1.30:
@@ -1477,6 +1506,11 @@ def search_hotelsdotcom_rapidapi(checkin: str, checkout: str, lat: float, lon: f
             ))
         except (KeyError, TypeError, ValueError):
             continue
+    if not hotels:
+        hotels = _parse_generic_rapidapi(
+            data, lat, lon, cap_usd, nights, checkin, checkout,
+            "hotels.com", "https://www.hotels.com",
+        )
     return hotels
 
 
