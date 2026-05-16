@@ -273,10 +273,12 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
             # Try every known price field path across booking-com15 API versions
             pb = prop.get("priceBreakdown", {})
             gross = pb.get("grossPrice", {})
+            # allInclusiveAmount includes taxes+fees — always prefer it
             total = (
-                _f(gross.get("value"))
+                _f(pb.get("allInclusiveAmount", {}).get("value"))
+                or _f(pb.get("allInclusiveAmount", {}).get("amount"))
+                or _f(gross.get("value"))
                 or _f(gross.get("amount"))
-                or _f(pb.get("allInclusiveAmount", {}).get("value"))
                 or _f(item.get("priceDisplayInfo", {})
                         .get("displayPrice", {})
                         .get("amountPerStay", {})
@@ -284,10 +286,12 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
                 or _f(prop.get("price"))
                 or 0.0
             )
+            currency = (pb.get("allInclusiveAmount", {}).get("currency")
+                        or gross.get("currency") or "USD")
+
             if total == 0:
                 continue
-
-            # API returns total-stay price; divide by nights
+            # API returns total-stay price; divide by nights for per-night rate
             per_night = total / nights
             if per_night > cap_usd * 1.30:
                 continue
@@ -304,7 +308,6 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
                 if hotel_id else booking_search_url(name, checkin, checkout)
             )
 
-            currency = gross.get("currency") or "USD"
             hotels.append(Hotel(
                 name=name,
                 price_per_night=per_night,
