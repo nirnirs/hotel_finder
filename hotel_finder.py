@@ -297,9 +297,12 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
             dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
 
             hotel_id = prop.get("id") or item.get("hotel_id", "")
-            url = (f"https://www.booking.com/hotel/us/{hotel_id}.html"
-                   f"?checkin={checkin}&checkout={checkout}&group_adults=1&no_rooms=1"
-                   if hotel_id else booking_search_url(name, checkin, checkout))
+            url = (
+                f"https://www.booking.com/searchresults.html"
+                f"?dest_id={hotel_id}&dest_type=hotel"
+                f"&checkin={checkin}&checkout={checkout}&group_adults=1&no_rooms=1"
+                if hotel_id else booking_search_url(name, checkin, checkout)
+            )
 
             currency = gross.get("currency") or "USD"
             hotels.append(Hotel(
