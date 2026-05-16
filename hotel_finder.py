@@ -10,17 +10,18 @@ Usage:
         --cap 470
 
 Live price sources (tried in order):
-  1. Amadeus Production API  — set AMADEUS_CLIENT_ID + AMADEUS_CLIENT_SECRET env vars
-                               Free signup: https://developers.amadeus.com (no credit card)
-  2. Booking.com scraper     — uses curl_cffi Chrome TLS impersonation to bypass bot checks
-  3. Hotels.com scraper      — same technique
-  4. Curated estimates       — July 2026 peak-season estimates with direct booking links
+  1. RapidAPI — Booking.com  — set RAPIDAPI_KEY env var (free tier at rapidapi.com)
+                               Uses the real Booking.com inventory, only needs `requests`
+  2. Amadeus Production API  — set AMADEUS_CLIENT_ID + AMADEUS_CLIENT_SECRET env vars
+  3. Booking.com scraper     — uses curl_cffi Chrome TLS impersonation to bypass bot checks
+  4. Hotels.com scraper      — same technique
+  5. Curated estimates       — July 2026 peak-season estimates with direct booking links
 
 Options:
   --lat / --lon    Skip geocoding by providing explicit coordinates
   --json           Output JSON instead of human-readable text
   --quiet          Suppress progress output
-  --source NAME    Force a specific source: amadeus | booking | hotelsdotcom | curated
+  --source NAME    Force a specific source: rapidapi | amadeus | booking | hotelsdotcom | curated
 """
 
 import argparse
@@ -143,7 +144,143 @@ def booking_search_url(name: str, checkin: str, checkout: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Source 1: Amadeus (Production or Sandbox)
+# Source 1: RapidAPI — Booking.com data (only needs `requests`, no extra packages)
+# ---------------------------------------------------------------------------
+# Free signup at https://rapidapi.com — search for "Booking.com" by apidojo or
+# "booking-com15" by DataCrawler. Free tier: ~100-500 req/month depending on provider.
+# Set env var: RAPIDAPI_KEY
+
+def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
+                    cap_usd: float, nights: int) -> list[Hotel]:
+    key = os.environ.get("RAPIDAPI_KEY", "")
+    if not key:
+        print("    no RAPIDAPI_KEY set", file=sys.stderr)
+        return []
+
+    # Step 1: get destination ID for the location
+    dest_id = _rapidapi_dest_id(lat, lon, key)
+    if not dest_id:
+        print("    could not resolve destination ID", file=sys.stderr)
+        return []
+
+    # Step 2: search hotels
+    headers = {
+        "x-rapidapi-key": key,
+        "x-rapidapi-host": "booking-com15.p.rapidapi.com",
+    }
+    try:
+        r = std_requests.get(
+            "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",
+            headers=headers,
+            params={
+                "dest_id": dest_id,
+                "search_type": "CITY",
+                "arrival_date": checkin,
+                "departure_date": checkout,
+                "adults": "1",
+                "room_qty": "1",
+                "page_number": "1",
+                "units": "metric",
+                "temperature_unit": "c",
+                "languagecode": "en-us",
+                "currency_code": "USD",
+            },
+            timeout=20,
+        )
+        if not r.ok:
+            print(f"    hotel search {r.status_code}: {r.text[:200]}", file=sys.stderr)
+            return []
+        data = r.json()
+    except Exception as e:
+        print(f"    hotel search error: {e}", file=sys.stderr)
+        return []
+
+    hotels = []
+    items = data.get("data", {}).get("hotels", []) or []
+    for item in items:
+        try:
+            prop = item.get("property", {})
+            name = prop.get("name", "")
+            if not name:
+                continue
+
+            # Price
+            price_info = prop.get("priceBreakdown", {})
+            gross = price_info.get("grossPrice", {})
+            total = float(gross.get("value", 0))
+            if total == 0:
+                # try alternative path
+                total = float(item.get("priceDisplayInfo", {})
+                               .get("displayPrice", {})
+                               .get("amountPerStay", {})
+                               .get("amountRounded", 0) or 0)
+            if total == 0:
+                continue
+
+            per_night = total / nights
+            if per_night > cap_usd * 1.30:
+                continue
+
+            hlat = float(prop.get("latitude", 0)) or None
+            hlon = float(prop.get("longitude", 0)) or None
+            dist = haversine_km(lat, lon, hlat, hlon) if hlat and hlon else None
+
+            hotel_id = prop.get("id") or item.get("hotel_id", "")
+            url = (f"https://www.booking.com/hotel/us/{hotel_id}.html"
+                   f"?checkin={checkin}&checkout={checkout}&group_adults=1&no_rooms=1"
+                   if hotel_id else booking_search_url(name, checkin, checkout))
+
+            hotels.append(Hotel(
+                name=name,
+                price_per_night=per_night,
+                total_price=total,
+                currency=gross.get("currency", "USD"),
+                address=prop.get("wishlistName", "") or prop.get("countryCode", ""),
+                stars=prop.get("propertyClass"),
+                rating=prop.get("reviewScore"),
+                url=url,
+                booking_url=url,
+                lat=hlat, lon=hlon, distance_km=dist,
+                source="rapidapi-booking",
+                price_is_live=True,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return hotels
+
+
+def _rapidapi_dest_id(lat: float, lon: float, key: str) -> Optional[str]:
+    """Resolve a lat/lon to a Booking.com destination ID via RapidAPI."""
+    headers = {
+        "x-rapidapi-key": key,
+        "x-rapidapi-host": "booking-com15.p.rapidapi.com",
+    }
+    # Try searching for "Chelsea New York" as the destination
+    for query in ["Chelsea, New York", "New York City"]:
+        try:
+            r = std_requests.get(
+                "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination",
+                headers=headers,
+                params={"query": query, "languagecode": "en-us"},
+                timeout=10,
+            )
+            if not r.ok:
+                continue
+            results = r.json().get("data", [])
+            # Prefer city-type results
+            for res in results:
+                if res.get("search_type") in ("city", "district", "landmark"):
+                    return str(res.get("dest_id", ""))
+            if results:
+                return str(results[0].get("dest_id", ""))
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Source 2: Amadeus (Production or Sandbox)
 # ---------------------------------------------------------------------------
 # Get a FREE production key at https://developers.amadeus.com — no credit card
 # Set env vars: AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET
@@ -764,13 +901,14 @@ def search_curated(checkin: str, checkout: str, lat: float, lon: float,
 # ---------------------------------------------------------------------------
 
 SOURCES = {
+    "rapidapi": ("RapidAPI / Booking.com", search_rapidapi),
     "amadeus": ("Amadeus API", search_amadeus),
-    "booking": ("Booking.com", search_booking),
-    "hotelsdotcom": ("Hotels.com", search_hotelsdotcom),
+    "booking": ("Booking.com scraper", search_booking),
+    "hotelsdotcom": ("Hotels.com scraper", search_hotelsdotcom),
     "curated": ("Curated estimates", search_curated),
 }
 
-_DEFAULT_ORDER = ["amadeus", "booking", "hotelsdotcom", "curated"]
+_DEFAULT_ORDER = ["rapidapi", "amadeus", "booking", "hotelsdotcom", "curated"]
 
 
 def find_hotels(checkin: str, checkout: str, location: str,
@@ -786,10 +924,11 @@ def find_hotels(checkin: str, checkout: str, location: str,
         raise ValueError(f"checkout must be after checkin ({nights} nights)")
 
     if verbose:
-        has_amadeus_key = bool(os.environ.get("AMADEUS_CLIENT_ID"))
-        key_status = "✓ Amadeus key found" if has_amadeus_key else "✗ No Amadeus key (set AMADEUS_CLIENT_ID + AMADEUS_CLIENT_SECRET for live prices)"
-        cffi_status = "✓ curl_cffi available" if CFFI_AVAILABLE else "✗ curl_cffi not found"
-        print(f"\n  {key_status}")
+        rapidapi_status = "✓ RapidAPI key found" if os.environ.get("RAPIDAPI_KEY") else "✗ No RAPIDAPI_KEY (free at rapidapi.com — search 'booking-com15')"
+        amadeus_status = "✓ Amadeus key found" if os.environ.get("AMADEUS_CLIENT_ID") else "✗ No Amadeus key"
+        cffi_status = "✓ curl_cffi available" if CFFI_AVAILABLE else "✗ curl_cffi not found (scrapers disabled)"
+        print(f"\n  {rapidapi_status}")
+        print(f"  {amadeus_status}")
         print(f"  {cffi_status}")
         print(f"\n  Location : {location}")
         print(f"  Dates    : {checkin} → {checkout} ({nights} nights)")
@@ -910,20 +1049,21 @@ def main():
         description="Find hotels near a location within a nightly price cap.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-LIVE PRICES — Amadeus (free):
-  1. Sign up at https://developers.amadeus.com (no credit card)
-  2. Create an app → copy Client ID and Client Secret
-  3. Run:
-       AMADEUS_CLIENT_ID=xxx AMADEUS_CLIENT_SECRET=yyy python3 hotel_finder.py ...
+LIVE PRICES (easiest — only needs `requests`, no extra packages):
+  1. Go to https://rapidapi.com and sign up (free)
+  2. Search for "booking-com15" → Subscribe to the FREE plan
+  3. Copy your API key from the dashboard
+  4. Run:
+       RAPIDAPI_KEY=xxx python3 hotel_finder.py ...
 
 Examples:
   python3 hotel_finder.py \\
       --checkin 2026-07-12 --checkout 2026-07-19 \\
       --location "111 8th Avenue, Chelsea, New York" --cap 470
 
-  AMADEUS_CLIENT_ID=xxx AMADEUS_CLIENT_SECRET=yyy python3 hotel_finder.py \\
+  RAPIDAPI_KEY=xxx python3 hotel_finder.py \\
       --checkin 2026-07-12 --checkout 2026-07-19 \\
-      --lat 40.7422 --lon -74.0041 --location "Google NYC" --cap 470
+      --location "111 8th Avenue, Chelsea, New York" --cap 470
 """,
     )
     parser.add_argument("--checkin", required=True)
@@ -936,7 +1076,7 @@ Examples:
     parser.add_argument("--source",
                         choices=list(SOURCES.keys()),
                         default=None,
-                        help="Force a specific data source")
+                        help="Force a specific source: rapidapi | amadeus | booking | hotelsdotcom | curated")
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
