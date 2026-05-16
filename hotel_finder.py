@@ -1186,22 +1186,26 @@ def search_priceline(checkin: str, checkout: str, lat: float, lon: float,
 
 def _sky_scrapper_entity_id(key: str) -> Optional[str]:
     headers = {"x-rapidapi-key": key, "x-rapidapi-host": "sky-scrapper.p.rapidapi.com"}
-    try:
-        r = std_requests.get(
-            "https://sky-scrapper.p.rapidapi.com/api/v1/hotels/searchDestination",
-            headers=headers,
-            params={"query": "Chelsea, New York"},
-            timeout=20,
-        )
-        if r.ok:
-            for item in r.json().get("data", []):
-                if item.get("entityType") in ("city", "district", "neighborhood", "place"):
+    for query in ["Chelsea, New York", "New York City"]:
+        try:
+            r = std_requests.get(
+                "https://sky-scrapper.p.rapidapi.com/api/v1/hotels/searchDestination",
+                headers=headers,
+                params={"query": query},
+                timeout=20,
+            )
+            if not r.ok:
+                continue
+            items = r.json().get("data", [])
+            # Sky Scrapper uses uppercase entity types
+            for item in items:
+                etype = (item.get("entityType") or "").upper()
+                if etype in ("CITY", "DISTRICT", "NEIGHBORHOOD", "PLACE", "LOCATION"):
                     return str(item.get("entityId", ""))
-            data = r.json().get("data", [])
-            if data:
-                return str(data[0].get("entityId", ""))
-    except Exception:
-        pass
+            if items:
+                return str(items[0].get("entityId", ""))
+        except Exception:
+            continue
     return None
 
 
@@ -1693,33 +1697,90 @@ def _debug_scrape(source: str, checkin: str, checkout: str) -> None:
                         "adults": "1", "room_qty": "1", "languagecode": "en-us", "currency_code": "USD"},
                 timeout=60,
             )
+        elif source == "skyscrapper":
+            print("=== Step 1: searchDestination ===")
+            r = std_requests.get(f"https://{host}/api/v1/hotels/searchDestination",
+                                 headers=headers, params={"query": "Chelsea, New York"}, timeout=20)
+            print(f"HTTP {r.status_code}\n{r.text[:1500]}\n")
+            entity_id = ""
+            if r.ok:
+                items = r.json().get("data", [])
+                if items:
+                    entity_id = str(items[0].get("entityId", ""))
+            if not entity_id:
+                print("Could not get entityId — stopping")
+                return
+            print(f"=== Step 2: searchHotels (entityId={entity_id}) ===")
+            r = std_requests.get(f"https://{host}/api/v1/hotels/searchHotels",
+                                 headers=headers,
+                                 params={"entityId": entity_id, "checkin": checkin,
+                                         "checkout": checkout, "adults": "1", "rooms": "1",
+                                         "currency": "USD", "countryCode": "US", "market": "en-US"},
+                                 timeout=40)
+            print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:3000]}")
+            return
+        elif source == "tripadvisor":
+            print("=== Step 1: searchLocation ===")
+            r = std_requests.get(f"https://{host}/api/v1/hotels/searchLocation",
+                                 headers=headers, params={"query": "Chelsea New York"}, timeout=20)
+            print(f"HTTP {r.status_code}\n{r.text[:1500]}\n")
+            geo_id = ""
+            if r.ok:
+                data = r.json().get("data", [])
+                items = data if isinstance(data, list) else data.get("results", [])
+                if items:
+                    geo_id = str(items[0].get("geoId") or items[0].get("locationId", ""))
+            if not geo_id:
+                print("Could not get geoId — stopping")
+                return
+            print(f"=== Step 2: searchHotels (geoId={geo_id}) ===")
+            r = std_requests.get(f"https://{host}/api/v1/hotels/searchHotels",
+                                 headers=headers,
+                                 params={"geoId": geo_id, "checkIn": checkin,
+                                         "checkOut": checkout, "adults": "1", "rooms": "1",
+                                         "currencyCode": "USD"},
+                                 timeout=40)
+            print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:3000]}")
+            return
+        elif source == "hotelsdotcom":
+            print("=== Step 1: regions lookup ===")
+            r = std_requests.get(f"https://{host}/v2/regions",
+                                 headers=headers,
+                                 params={"query": "Chelsea New York", "domain": "US", "locale": "en_US"},
+                                 timeout=20)
+            print(f"HTTP {r.status_code}\n{r.text[:1500]}\n")
+            region_id = ""
+            if r.ok:
+                for region in r.json().get("data", []):
+                    if region.get("type") in ("CITY", "NEIGHBORHOOD", "POI"):
+                        region_id = str(region.get("gaiaId") or region.get("id", ""))
+                        break
+            if not region_id:
+                print("Could not get region_id — stopping")
+                return
+            print(f"=== Step 2: hotel search (region_id={region_id}) ===")
+            r = std_requests.get(f"https://{host}/v2/hotels/search",
+                                 headers=headers,
+                                 params={"region_id": region_id, "checkin_date": checkin,
+                                         "checkout_date": checkout, "adults_number": "1",
+                                         "rooms_number": "1", "currency": "USD",
+                                         "locale": "en_US", "domain": "US"},
+                                 timeout=40)
+            print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:3000]}")
+            return
         else:
-            # For new sources: probe common endpoint/param variants and dump response
-            endpoint_variants = [
-                "/api/v1/hotels/searchHotels", "/api/v1/hotels/search",
-                "/api/hotel/search", "/v2/hotel/search", "/hotels/search",
-                "/v2/hotels/search", "/v2/regions",
-            ]
-            param_variants = [
-                {"query": "Chelsea New York", "checkIn": checkin, "checkOut": checkout,
-                 "adults": "1", "rooms": "1", "currency": "USD"},
-                {"check_in_date": checkin, "check_out_date": checkout,
-                 "city_name": "New York", "country_code": "US",
-                 "adults": "1", "rooms_number": "1", "currency": "USD"},
-                {"query": "Chelsea New York", "domain": "US", "locale": "en_US"},
-            ]
-            for endpoint in endpoint_variants:
-                for params in param_variants[:1]:  # just first param shape per endpoint
-                    try:
-                        r = std_requests.get(f"https://{host}{endpoint}",
-                                             headers=headers, params=params, timeout=25)
-                        print(f"=== {endpoint} → HTTP {r.status_code} ({len(r.text)} chars) ===")
-                        print(r.text[:800])
-                        print()
-                        if r.ok:
-                            break
-                    except Exception as e:
-                        print(f"=== {endpoint} → ERROR: {e} ===\n")
+            # Generic probe for any other source
+            for endpoint in ["/api/hotel/search", "/v2/hotel/search", "/hotels/search"]:
+                try:
+                    r = std_requests.get(f"https://{host}{endpoint}", headers=headers,
+                                         params={"check_in_date": checkin, "check_out_date": checkout,
+                                                 "city_name": "New York", "country_code": "US",
+                                                 "adults": "1", "rooms_number": "1"}, timeout=25)
+                    print(f"=== {endpoint} → HTTP {r.status_code} ({len(r.text)} chars) ===\n{r.text[:1000]}\n")
+                    if r.ok:
+                        break
+                except Exception as e:
+                    print(f"=== {endpoint} → ERROR: {e} ===\n")
             return
 
         print(f"HTTP {r.status_code}  ({len(r.text)} chars)\n{r.text[:3000]}")
