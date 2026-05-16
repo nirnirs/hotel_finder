@@ -168,31 +168,35 @@ def search_rapidapi(checkin: str, checkout: str, lat: float, lon: float,
         "x-rapidapi-key": key,
         "x-rapidapi-host": "booking-com15.p.rapidapi.com",
     }
-    try:
-        r = std_requests.get(
-            "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",
-            headers=headers,
-            params={
-                "dest_id": dest_id,
-                "search_type": "CITY",
-                "arrival_date": checkin,
-                "departure_date": checkout,
-                "adults": "1",
-                "room_qty": "1",
-                "page_number": "1",
-                "units": "metric",
-                "temperature_unit": "c",
-                "languagecode": "en-us",
-                "currency_code": "USD",
-            },
-            timeout=20,
-        )
-        if not r.ok:
-            print(f"    hotel search {r.status_code}: {r.text[:200]}", file=sys.stderr)
-            return []
-        data = r.json()
-    except Exception as e:
-        print(f"    hotel search error: {e}", file=sys.stderr)
+    params = {
+        "dest_id": dest_id,
+        "search_type": "CITY",
+        "arrival_date": checkin,
+        "departure_date": checkout,
+        "adults": "1",
+        "room_qty": "1",
+        "page_number": "1",
+        "units": "metric",
+        "temperature_unit": "c",
+        "languagecode": "en-us",
+        "currency_code": "USD",
+    }
+    data = None
+    for attempt, timeout in enumerate([30, 45, 60], 1):
+        try:
+            r = std_requests.get(
+                "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
+            if r.ok:
+                data = r.json()
+                break
+            print(f"    hotel search attempt {attempt}: {r.status_code}", file=sys.stderr)
+        except Exception as e:
+            print(f"    hotel search attempt {attempt} error: {e}", file=sys.stderr)
+    if data is None:
         return []
 
     hotels = []
