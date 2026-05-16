@@ -1204,14 +1204,13 @@ def search_expedia(checkin: str, checkout: str, lat: float, lon: float,
 SOURCES = {
     "booking": ("Booking.com", search_rapidapi),
     "priceline": ("Priceline", search_priceline),
-    "expedia": ("Expedia", search_expedia),
     "amadeus": ("Amadeus API", search_amadeus),
     "booking-scraper": ("Booking.com scraper", search_booking),
     "hotelsdotcom": ("Hotels.com scraper", search_hotelsdotcom),
     "curated": ("Curated estimates", search_curated),
 }
 
-_DEFAULT_ORDER = ["booking", "priceline", "expedia", "amadeus", "booking-scraper", "hotelsdotcom", "curated"]
+_DEFAULT_ORDER = ["booking", "priceline", "amadeus", "booking-scraper", "hotelsdotcom", "curated"]
 
 
 def find_hotels(checkin: str, checkout: str, location: str,
