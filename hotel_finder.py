@@ -133,6 +133,9 @@ class Hotel:
         self.distance_km = distance_km
         self.source = source
         self.price_is_live = price_is_live
+        self.google_maps_url: str = ""
+        self.google_rating: Optional[float] = None
+        self.google_rating_count: Optional[int] = None
 
 
 def booking_search_url(name: str, checkin: str, checkout: str) -> str:
@@ -141,6 +144,65 @@ def booking_search_url(name: str, checkin: str, checkout: str) -> str:
         f"https://www.booking.com/search.html?ss={q}"
         f"&checkin={checkin}&checkout={checkout}&group_adults=1&no_rooms=1"
     )
+
+
+def google_maps_search_url(name: str, address: str = "") -> str:
+    query = urllib.parse.quote_plus(f"{name} {address}".strip())
+    return f"https://www.google.com/maps/search/?api=1&query={query}"
+
+
+def google_maps_place_url(place_id: str) -> str:
+    return f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+
+# ---------------------------------------------------------------------------
+# Google Maps Places enrichment (optional — set GOOGLE_MAPS_API_KEY)
+# ---------------------------------------------------------------------------
+# Get a free API key at https://console.cloud.google.com
+# Enable "Places API" → create a key → restrict to Places API
+# Free tier: $200/month credit (~11,000 text searches free)
+
+def enrich_with_google_maps(hotels: list[Hotel], verbose: bool = True) -> None:
+    """Fetch Google Maps ratings + place URLs for each hotel. Mutates in place."""
+    key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+    if not key:
+        # No key: at least set a search URL for every hotel
+        for h in hotels:
+            h.google_maps_url = google_maps_search_url(h.name, h.address)
+        return
+
+    if verbose:
+        print(f"\n  [Google Maps] Fetching ratings for {len(hotels)} hotels...", flush=True)
+
+    for h in hotels:
+        h.google_maps_url = google_maps_search_url(h.name, h.address)  # fallback
+        try:
+            r = std_requests.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={
+                    "query": f"{h.name} New York",
+                    "key": key,
+                    "type": "lodging",
+                },
+                timeout=10,
+            )
+            if not r.ok:
+                continue
+            results = r.json().get("results", [])
+            if not results:
+                continue
+            place = results[0]
+            h.google_rating = place.get("rating")
+            h.google_rating_count = place.get("user_ratings_total")
+            place_id = place.get("place_id", "")
+            if place_id:
+                h.google_maps_url = google_maps_place_url(place_id)
+        except Exception:
+            continue
+
+    if verbose:
+        enriched = sum(1 for h in hotels if h.google_rating is not None)
+        print(f"  [Google Maps] Got ratings for {enriched}/{len(hotels)} hotels")
 
 
 # ---------------------------------------------------------------------------
@@ -931,9 +993,11 @@ def find_hotels(checkin: str, checkout: str, location: str,
         rapidapi_status = "✓ RapidAPI key found" if os.environ.get("RAPIDAPI_KEY") else "✗ No RAPIDAPI_KEY (free at rapidapi.com — search 'booking-com15')"
         amadeus_status = "✓ Amadeus key found" if os.environ.get("AMADEUS_CLIENT_ID") else "✗ No Amadeus key"
         cffi_status = "✓ curl_cffi available" if CFFI_AVAILABLE else "✗ curl_cffi not found (scrapers disabled)"
+        maps_status = "✓ Google Maps key found (ratings enabled)" if os.environ.get("GOOGLE_MAPS_API_KEY") else "✗ No GOOGLE_MAPS_API_KEY (Maps links included, ratings skipped)"
         print(f"\n  {rapidapi_status}")
         print(f"  {amadeus_status}")
         print(f"  {cffi_status}")
+        print(f"  {maps_status}")
         print(f"\n  Location : {location}")
         print(f"  Dates    : {checkin} → {checkout} ({nights} nights)")
         print(f"  Cap      : ${cap_usd:.0f}/night  (showing up to ${cap_usd * 1.30:.0f})\n")
@@ -984,7 +1048,9 @@ def find_hotels(checkin: str, checkout: str, location: str,
         [h for h in all_hotels if h.price_per_night > cap_usd],
         key=lambda h: (not h.price_is_live, h.price_per_night),
     )
-    return within + over
+    results = within + over
+    enrich_with_google_maps(results, verbose=verbose)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1031,17 +1097,26 @@ def format_results(hotels: list[Hotel], cap_usd: float, nights: int,
 
 def _fmt(rank: int, h: Hotel, nights: int) -> list[str]:
     stars = "★" * int(h.stars or 0)
-    rating = f"  ·  {h.rating:.1f}/10" if h.rating else ""
+    # Prefer Google Maps rating if available, fall back to source rating
+    if h.google_rating is not None:
+        count_str = f" ({h.google_rating_count:,} reviews)" if h.google_rating_count else ""
+        rating = f"  ·  Google ★ {h.google_rating:.1f}{count_str}"
+    elif h.rating:
+        rating = f"  ·  {h.rating:.1f}/10"
+    else:
+        rating = ""
     dist = f"  ·  {h.distance_km:.2f} km" if h.distance_km is not None else ""
     price_tag = "LIVE" if h.price_is_live else "est."
-    return [
+    lines = [
         f"  {rank:>2}.  {h.name}",
         f"        {stars}{rating}{dist}",
         f"        ${h.price_per_night:.0f}/night  (${h.total_price:.0f} total)  [{price_tag}]",
         f"        {h.address}",
-        f"        {h.booking_url or h.url}",
+        f"        Book:  {h.booking_url or h.url}",
+        f"        Maps:  {h.google_maps_url}",
         "",
     ]
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1108,6 +1183,9 @@ Examples:
             "address": h.address,
             "stars": h.stars,
             "rating": h.rating,
+            "google_rating": h.google_rating,
+            "google_rating_count": h.google_rating_count,
+            "google_maps_url": h.google_maps_url,
             "distance_km": round(h.distance_km, 3) if h.distance_km is not None else None,
             "within_cap": h.price_per_night <= args.cap,
             "price_is_live": h.price_is_live,
